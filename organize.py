@@ -1,11 +1,14 @@
 """Organize GoPro time-lapse photos into one folder per time-lapse.
 
 GoPro time-lapse files are named ``GxxxYYYY.JPG`` where ``xxx`` identifies the
-time-lapse group and ``YYYY`` is the incremental photo number inside it.
+time-lapse group and ``YYYY`` is the incremental photo number.
 Group ids wrap around (001-999), so the same id is reused by unrelated
-time-lapses over time. Photos are therefore sorted chronologically and a new
-time-lapse starts whenever the group id changes or the time gap between two
-consecutive photos exceeds a threshold.
+time-lapses over time, and a single time-lapse may span several folders.
+
+To keep things fast, only the first and last photo of each group inside a
+folder are read (one segment per folder and group). Segments with the same
+group id are then merged across folders when one starts right after the
+previous one ends.
 
 Each time-lapse is moved into a folder named after the capture date/time of
 its first photo (``yyyyMMdd_HHmmss``), created directly under the images root.
@@ -17,7 +20,8 @@ import argparse
 import re
 import shutil
 import sys
-from dataclasses import dataclass
+from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -33,17 +37,18 @@ DEFAULT_ROOT = Path(__file__).resolve().parent / "images"
 DEFAULT_MAX_GAP_SECONDS = 120
 
 
-@dataclass(frozen=True)
-class Photo:
-    path: Path
+@dataclass
+class Segment:
+    """Photos of one group, sorted by sequence, possibly spanning several folders."""
+
     group: str
-    seq: int
-    taken: datetime
+    start: datetime
+    end: datetime
+    photos: list[Path] = field(default_factory=list)
 
     @property
-    def sort_key(self) -> tuple[datetime, str, int]:
-        # Folder and sequence break ties between photos taken in the same second
-        return self.taken, self.path.parent.name, self.seq
+    def folders(self) -> list[str]:
+        return sorted({p.parent.name for p in self.photos})
 
 
 def read_capture_time(path: Path) -> datetime:
@@ -60,32 +65,63 @@ def read_capture_time(path: Path) -> datetime:
     return datetime.fromtimestamp(path.stat().st_mtime)
 
 
-def collect_photos(root: Path) -> list[Photo]:
-    """Find time-lapse photos in the source subfolders, sorted chronologically."""
-    photos: list[Photo] = []
+def scan_folder(folder: Path) -> list[Segment]:
+    """Build one segment per group found in the folder, reading only its first and last photo."""
+    by_group: dict[str, list[tuple[int, Path]]] = defaultdict(list)
+    for file in folder.iterdir():
+        match = FILE_PATTERN.match(file.name)
+        if match and file.is_file():
+            by_group[match["group"]].append((int(match["seq"]), file))
+
+    segments = []
+    for group, entries in by_group.items():
+        entries.sort()
+        photos = [path for _, path in entries]
+        start = read_capture_time(photos[0])
+        end = read_capture_time(photos[-1]) if len(photos) > 1 else start
+        segments.append(Segment(group, start, end, photos))
+    return segments
+
+
+def collect_segments(root: Path) -> list[Segment]:
+    """Scan all source subfolders of root."""
+    segments: list[Segment] = []
     for folder in sorted(p for p in root.iterdir() if p.is_dir()):
         # Skip folders produced by a previous run
         if TARGET_DIR_PATTERN.match(folder.name):
             continue
         print(f"Scanning {folder.name}...")
-        for file in folder.iterdir():
-            match = FILE_PATTERN.match(file.name)
-            if file.is_file() and match:
-                photos.append(Photo(file, match["group"], int(match["seq"]), read_capture_time(file)))
-    photos.sort(key=lambda p: p.sort_key)
-    return photos
+        segments.extend(scan_folder(folder))
+    return segments
 
 
-def split_timelapses(photos: list[Photo], max_gap: timedelta) -> list[list[Photo]]:
-    """Split chronologically sorted photos into individual time-lapses."""
-    timelapses: list[list[Photo]] = []
-    for photo in photos:
-        current = timelapses[-1] if timelapses else None
-        if current and current[-1].group == photo.group and photo.taken - current[-1].taken <= max_gap:
-            current.append(photo)
-        else:
-            timelapses.append([photo])
-    return timelapses
+def merge_segments(segments: list[Segment], max_gap: timedelta) -> list[Segment]:
+    """Merge segments of the same group where one starts right after the other ends.
+
+    Segments are sorted by start time and swept once: each segment is appended
+    to the previous merged one when the gap is small enough. Since a merged
+    segment takes the end of its last part, chains of any length (A+B+C, or
+    (A+B)+(C+D)) collapse in a single pass, giving the same result as merging
+    repeatedly until nothing changes.
+    """
+    by_group: dict[str, list[Segment]] = defaultdict(list)
+    for segment in segments:
+        by_group[segment.group].append(segment)
+
+    merged: list[Segment] = []
+    for group_segments in by_group.values():
+        group_segments.sort(key=lambda s: (s.start, s.folders))
+        current = group_segments[0]
+        for segment in group_segments[1:]:
+            if timedelta(0) <= segment.start - current.end <= max_gap:
+                current = Segment(current.group, current.start, segment.end,
+                                  current.photos + segment.photos)
+            else:
+                merged.append(current)
+                current = segment
+        merged.append(current)
+    merged.sort(key=lambda s: s.start)
+    return merged
 
 
 def unique_target_dir(root: Path, name: str, reserved: set[str]) -> Path:
@@ -99,32 +135,31 @@ def unique_target_dir(root: Path, name: str, reserved: set[str]) -> Path:
 
 
 def organize(root: Path, max_gap: timedelta, dry_run: bool) -> None:
-    photos = collect_photos(root)
-    if not photos:
+    segments = collect_segments(root)
+    if not segments:
         print(f"No time-lapse photos found in {root}")
         return
 
     source_dirs: set[Path] = set()
     # In dry run folders are not created, so planned names are tracked as well
     planned: set[str] = set()
-    for timelapse in split_timelapses(photos, max_gap):
-        first, last = timelapse[0], timelapse[-1]
-        target = unique_target_dir(root, first.taken.strftime("%Y%m%d_%H%M%S"), planned)
+    for timelapse in merge_segments(segments, max_gap):
+        target = unique_target_dir(root, timelapse.start.strftime("%Y%m%d_%H%M%S"), planned)
         planned.add(target.name)
 
-        folders = sorted({p.path.parent.name for p in timelapse})
-        print(f"Group {first.group}: {len(timelapse)} photos "
-              f"({first.path.name} .. {last.path.name}, {', '.join(folders)}) -> {target.name}")
+        first, last = timelapse.photos[0], timelapse.photos[-1]
+        print(f"Group {timelapse.group}: {len(timelapse.photos)} photos "
+              f"({first.name} .. {last.name}, {', '.join(timelapse.folders)}) -> {target.name}")
         if dry_run:
             continue
         target.mkdir()
-        for photo in timelapse:
-            destination = target / photo.path.name
+        for photo in timelapse.photos:
+            destination = target / photo.name
             if destination.exists():
-                print(f"  warning: {destination} already exists, {photo.path} left in place")
+                print(f"  warning: {destination} already exists, {photo} left in place")
                 continue
-            source_dirs.add(photo.path.parent)
-            shutil.move(str(photo.path), str(destination))
+            source_dirs.add(photo.parent)
+            shutil.move(str(photo), str(destination))
 
     # Remove source folders left empty after the move
     for folder in source_dirs:
@@ -143,8 +178,8 @@ def main() -> int:
     parser.add_argument("-n", "--dry-run", action="store_true",
                         help="show what would be done without moving files")
     parser.add_argument("--max-gap", type=int, default=DEFAULT_MAX_GAP_SECONDS, metavar="SECONDS",
-                        help="max seconds between two photos of the same time-lapse "
-                             f"(default: {DEFAULT_MAX_GAP_SECONDS})")
+                        help="max seconds between the last photo of a folder and the first photo "
+                             f"of the next folder in the same time-lapse (default: {DEFAULT_MAX_GAP_SECONDS})")
     args = parser.parse_args()
 
     root: Path = args.root.resolve()
