@@ -35,6 +35,12 @@ EXIF_IFD = 0x8769
 DEFAULT_ROOT = Path(__file__).resolve().parent / "images"
 # The longest GoPro Session 5 time-lapse interval is 60 s
 DEFAULT_MAX_GAP_SECONDS = 120
+# Time-lapses with fewer photos are excluded from the second duration statistics
+MIN_PHOTOS_FOR_STATS = 60
+
+
+class SequenceGapError(Exception):
+    """Raised when photos of the same group in a folder are not consecutive."""
 
 
 @dataclass
@@ -49,6 +55,10 @@ class Segment:
     @property
     def folders(self) -> list[str]:
         return sorted({p.parent.name for p in self.photos})
+
+    @property
+    def duration(self) -> timedelta:
+        return self.end - self.start
 
 
 def read_capture_time(path: Path) -> datetime:
@@ -65,8 +75,18 @@ def read_capture_time(path: Path) -> datetime:
     return datetime.fromtimestamp(path.stat().st_mtime)
 
 
-def scan_folder(folder: Path) -> list[Segment]:
-    """Build one segment per group found in the folder, reading only its first and last photo."""
+def find_sequence_gaps(entries: list[tuple[int, Path]]) -> list[str]:
+    """Describe every break in the numbering of sorted (seq, path) entries."""
+    return [f"{prev.name} -> {curr.name}"
+            for (prev_seq, prev), (curr_seq, curr) in zip(entries, entries[1:])
+            if curr_seq != prev_seq + 1]
+
+
+def scan_folder(folder: Path, errors: list[str]) -> list[Segment]:
+    """Build one segment per group found in the folder, reading only its first and last photo.
+
+    Groups whose photos are not consecutive are reported in errors and skipped.
+    """
     by_group: dict[str, list[tuple[int, Path]]] = defaultdict(list)
     for file in folder.iterdir():
         match = FILE_PATTERN.match(file.name)
@@ -74,8 +94,12 @@ def scan_folder(folder: Path) -> list[Segment]:
             by_group[match["group"]].append((int(match["seq"]), file))
 
     segments = []
-    for group, entries in by_group.items():
+    for group, entries in sorted(by_group.items()):
         entries.sort()
+        gaps = find_sequence_gaps(entries)
+        if gaps:
+            errors.extend(f"{folder.name}, group {group}: non-consecutive photos {gap}" for gap in gaps)
+            continue
         photos = [path for _, path in entries]
         start = read_capture_time(photos[0])
         end = read_capture_time(photos[-1]) if len(photos) > 1 else start
@@ -84,14 +108,21 @@ def scan_folder(folder: Path) -> list[Segment]:
 
 
 def collect_segments(root: Path) -> list[Segment]:
-    """Scan all source subfolders of root."""
+    """Scan all source subfolders of root.
+
+    Every folder is checked before raising, so all numbering problems are
+    reported at once and nothing is moved.
+    """
     segments: list[Segment] = []
+    errors: list[str] = []
     for folder in sorted(p for p in root.iterdir() if p.is_dir()):
         # Skip folders produced by a previous run
         if TARGET_DIR_PATTERN.match(folder.name):
             continue
         print(f"Scanning {folder.name}...")
-        segments.extend(scan_folder(folder))
+        segments.extend(scan_folder(folder, errors))
+    if errors:
+        raise SequenceGapError("\n".join(errors))
     return segments
 
 
@@ -134,6 +165,32 @@ def unique_target_dir(root: Path, name: str, reserved: set[str]) -> Path:
     return target
 
 
+def format_duration(value: timedelta) -> str:
+    """Format a duration as H:MM:SS, dropping microseconds."""
+    return str(timedelta(seconds=round(value.total_seconds())))
+
+
+def print_duration_stats(label: str, timelapses: list[Segment]) -> None:
+    if not timelapses:
+        print(f"  {label}: none")
+        return
+    durations = [t.duration for t in timelapses]
+    average = sum(durations, timedelta(0)) / len(durations)
+    print(f"  {label} ({len(timelapses)} time-lapses): min {format_duration(min(durations))}, "
+          f"max {format_duration(max(durations))}, avg {format_duration(average)}")
+
+
+def print_summary(timelapses: list[Segment], dry_run: bool) -> None:
+    print("\nSummary")
+    print(f"  Files parsed: {sum(len(t.photos) for t in timelapses)}")
+    print(f"  Folders {'to create' if dry_run else 'created'} (distinct time-lapses): {len(timelapses)}")
+    print_duration_stats("Duration, all", timelapses)
+    print_duration_stats(f"Duration, {MIN_PHOTOS_FOR_STATS}+ photos",
+                         [t for t in timelapses if len(t.photos) >= MIN_PHOTOS_FOR_STATS])
+    print(f"  Photo dates: {min(t.start for t in timelapses):%Y-%m-%d %H:%M:%S} .. "
+          f"{max(t.end for t in timelapses):%Y-%m-%d %H:%M:%S}")
+
+
 def organize(root: Path, max_gap: timedelta, dry_run: bool) -> None:
     segments = collect_segments(root)
     if not segments:
@@ -143,7 +200,8 @@ def organize(root: Path, max_gap: timedelta, dry_run: bool) -> None:
     source_dirs: set[Path] = set()
     # In dry run folders are not created, so planned names are tracked as well
     planned: set[str] = set()
-    for timelapse in merge_segments(segments, max_gap):
+    timelapses = merge_segments(segments, max_gap)
+    for timelapse in timelapses:
         target = unique_target_dir(root, timelapse.start.strftime("%Y%m%d_%H%M%S"), planned)
         planned.add(target.name)
 
@@ -167,6 +225,7 @@ def organize(root: Path, max_gap: timedelta, dry_run: bool) -> None:
             folder.rmdir()
             print(f"Removed empty folder {folder.name}")
 
+    print_summary(timelapses, dry_run)
     if dry_run:
         print("Dry run: no files were moved.")
 
@@ -186,7 +245,12 @@ def main() -> int:
     if not root.is_dir():
         print(f"Folder not found: {root}", file=sys.stderr)
         return 1
-    organize(root, timedelta(seconds=args.max_gap), args.dry_run)
+    try:
+        organize(root, timedelta(seconds=args.max_gap), args.dry_run)
+    except SequenceGapError as error:
+        print(f"Error: photos of the same group are not consecutive, nothing was moved.\n{error}",
+              file=sys.stderr)
+        return 2
     return 0
 
 
