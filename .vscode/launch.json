@@ -1,0 +1,20 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Organize (dry run)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/organize.py",
+            "args": ["--dry-run"],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Organize",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/organize.py",
+            "console": "integratedTerminal"
+        }
+    ]
+}

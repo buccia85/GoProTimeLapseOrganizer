@@ -1,0 +1,32 @@
+# Photos (local data, not versioned)
+images/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Packaging
+build/
+dist/
+*.egg-info/
+
+# Environment files
+.env
+
+# VS Code (keep shared project settings)
+.vscode/*
+!.vscode/settings.json
+!.vscode/launch.json
+
+# OS files
+Thumbs.db
+desktop.ini
+.DS_Store
